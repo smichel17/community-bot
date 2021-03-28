@@ -12,7 +12,6 @@ import {
 	Guild,
 	TextChannel,
 	GuildMember,
-	User,
 	ChannelData,
 	CategoryChannel,
 } from 'discord.js';
@@ -33,36 +32,40 @@ import {
 import { isTrustedMember } from '../util/inhibitors';
 
 const AVAILABLE_MESSAGE = `
-**Send your question here to claim the channel**
-This channel will be dedicated to answering your question only. Others will try to answer and help you solve the issue.
+⠀
+**Send your question here to claim the channel.**
+It's always ok to just ask your question; you don't need permission. More info: <#${askHelpChannelId}>
 
 **Keep in mind:**
-• It's always ok to just ask your question. You don't need permission.
 • Explain what you expect to happen and what actually happens.
 • Include a code sample and error message, if you got any.
 
 For more tips, check out StackOverflow's guide on **[asking good questions](https://stackoverflow.com/help/how-to-ask)**.
+
+Others will try to answer and help you solve the issue. 
 `;
 
 // The "empty" line has a braille pattern blank unicode character, in order to
 // achieve a leading newline, since normally whitespace is stripped. This is a
 // hack, but it works even on a system without the fonts to display Discord
 // emoji, so it should work everywhere. https://www.compart.com/en/unicode/U+2800
-const occupiedMessage = (asker: User) => `
+// • Share a minimal code example. Include the error(s) and which line produces them.
+const occupiedMessage = (asker: GuildeMember) => `
+Each help channel is dedicated to helping one person at a time. Details: <#${askHelpChannelId}>
 ⠀
-**This channel is claimed by ${asker}.**
-It is dedicated to answering their questions only. More info: <#${askHelpChannelId}>
+**This channel is reserved by ${asker}.**
 
-**${asker} You'll get better and faster answers if you:**
-• Describe the context. What are you trying to accomplish?
-• Include any error messages, and the code that produce them (5-15 lines).
-⠀• Use code blocks, not screenshots. Start with ${'```ts'} for syntax highlighting.
-• Also reproduce the issue in the **[TypeScript Playground](https://www.typescriptlang.org/play)**, if possible.
-⠀• Do not use a link shortener; paste the full url in its own message.
-
-Usually someone will try to answer and help solve the issue within a few hours. If not, and you have followed the bullets above, you may ping the <@&${trustedRoleId}> role.
+${asker} Please help others help you; for better and faster answers…
+• Describe the broader context. What are you trying to accomplish and why?
+• Share what you already tried. Include any errors & which line caused them.
+• Use code blocks, not screenshots. Start with ${'```ts'} for syntax highlighting.
+• Keep it short (5-15 lines). Leave out lines not needed to demonstrate the problem.
+• Optional: share a longer example in the **[TypeScript Playground](https://www.typescriptlang.org/play)**. The bot will shorten links.
+⠀• Best option: BOTH a playground and code block excerpt
 
 For more tips, check out StackOverflow's guide on **[asking good questions](https://stackoverflow.com/help/how-to-ask)**.
+
+Usually someone will try to answer and help solve the issue within a few hours. If not, and **if you have followed the bullets above**, you may ping the <@&${trustedRoleId}> role (please allow extra time at night in America/Europe).
 `;
 
 const DORMANT_MESSAGE = `
@@ -92,13 +95,15 @@ export class HelpChanModule extends Module {
 		.setTitle('⌛ Occupied Help Channel')
 		.setColor(HOURGLASS_ORANGE);
 
-	occupiedEmbed(asker: User) {
+	occupiedEmbed(asker: GuildMember) {
 		return new MessageEmbed(this.OCCUPIED_EMBED_BASE)
 			.setDescription(occupiedMessage(asker))
 			.setFooter(
 				`Closes after ${
 					dormantChannelTimeout / 60 / 60 / 1000
-				} hours of inactivity or when ${asker.username} sends !close.`,
+				} hours of inactivity or when ${
+					asker.displayName
+				} sends !close.`,
 			);
 	}
 
