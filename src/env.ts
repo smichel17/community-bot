@@ -40,3 +40,5 @@ export const TS_BLUE = '#007ACC';
 export const GREEN = '#77b155';
 // Picked from Discord's "hourglass" emoji (in ⌛ | Occupied Help Channels)
 export const HOURGLASS_ORANGE = '#ffa647';
+// Same, from Discord's :ballot_box_with_check: emoji (☑)
+export const BALLOT_BOX_BLUE = '#066696';
