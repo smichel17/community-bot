@@ -25,7 +25,6 @@ import {
 	askCooldownRoleId,
 	channelNames,
 	dormantChannelTimeout,
-	dormantChannelLoop,
 	askHelpChannelId,
 	ongoingEmptyTimeout,
 	trustedRoleId,
@@ -127,7 +126,7 @@ export class HelpChanModule extends Module {
 		.setDescription(DORMANT_MESSAGE);
 
 	busyChannels: Set<string> = new Set(); // a lock to eliminate race conditions
-	ongoingEmptyTimeouts: Map<string, NodeJS.Timeout> = new Map(); // a lock used to prevent multiple timeouts running on the same channel
+	ongoingLoops: Map<string, NodeJS.Timeout> = new Map(); // a lock used to prevent multiple timeouts running on the same channel
 
 	private getChannelName(guild: Guild) {
 		const takenChannelNames = guild.channels.cache
@@ -153,60 +152,76 @@ export class HelpChanModule extends Module {
 	}
 
 	@listener({ event: 'ready' })
-	async startDormantLoop() {
-		setInterval(() => {
-			this.checkDormantPossibilities();
-		}, dormantChannelLoop);
-	}
-
-	@listener({ event: 'ready' })
-	async initialCheckEmptyOngoing() {
+	async startOngoingLoops() {
 		for (const channel of this.getOngoingChannels()) {
-			if (await this.checkEmptyOngoing(channel)) {
+			const latest = (await channel.messages.fetch()).first();
+			if (latest && this.isOngoingStatus(latest)) {
 				await this.startEmptyTimeout(channel);
+			} else {
+				await this.startDormantLoop(channel, latest);
 			}
 		}
 	}
 
-	// Utility function used to check if there are no messages in an ongoing channel, meaning the bot
-	// is the most recent message. This will be caused if somebody deletes their message after they
-	// claim a channel.
-	async checkEmptyOngoing(channel: TextChannel) {
-		const messages = await channel.messages.fetch();
-
-		const embed = messages.first()?.embeds[0];
-
-		return (
-			embed?.title &&
-			embed.title.trim() === this.OCCUPIED_EMBED_BASE.title?.trim()
-		);
+	async isOngoingStatus(msg: Message) {
+		const title = msg?.embeds[0]?.title?.trim();
+		return title && title === this.OCCUPIED_EMBED_BASE.title?.trim();
 	}
 
+	// If somebody deletes their message after they claim a channel, the
+	// bot's status message will be the most recent.
+	// If it stays this way after a short delay, close the channel.
 	async startEmptyTimeout(channel: TextChannel) {
-		const existingTimeout = this.ongoingEmptyTimeouts.get(channel.id);
-		if (existingTimeout) clearTimeout(existingTimeout);
-
 		const timeout = setTimeout(async () => {
-			this.ongoingEmptyTimeouts.delete(channel.id);
-
-			if (await this.checkEmptyOngoing(channel)) {
+			const latest = (await channel.messages.fetch()).first();
+			if (latest && this.isOngoingStatus(latest)) {
 				await this.markChannelAsDormant(channel);
+				this.ongoingLoops.delete(channel.id);
+			} else {
+				await this.startDormantLoop(channel, latest);
 			}
 		}, ongoingEmptyTimeout);
 
-		this.ongoingEmptyTimeouts.set(channel.id, timeout);
+		this.ongoingLoops.set(channel.id, timeout);
+	}
+
+	async startDormantLoop(channel: TextChannel, latest?: Message) {
+		const elapsed = Date.now() - (latest?.createdTimestamp ?? 0);
+
+		if (elapsed > dormantChannelTimeout) {
+			await this.markChannelAsDormant(channel);
+			this.ongoingLoops.delete(channel.id);
+		} else {
+			const timeUntilDormant = dormantChannelTimeout - elapsed;
+
+			const timeout = setTimeout(async () => {
+				const messages = await channel.messages.fetch();
+				await this.startDormantLoop(channel, messages.first());
+			}, timeUntilDormant);
+
+			this.ongoingLoops.set(channel.id, timeout);
+		}
 	}
 
 	@listener({ event: 'messageDelete' })
 	async onMessageDeleted(msg: Message) {
+		const { channel } = msg;
 		if (
-			msg.channel.type !== 'text' ||
-			!msg.channel.parentID ||
-			msg.channel.parentID !== categories.ongoing
+			channel.type !== 'text' ||
+			!channel.parentID ||
+			channel.parentID !== categories.ongoing
 		)
 			return;
 
-		await this.startEmptyTimeout(msg.channel);
+		const existingTimeout = this.ongoingLoops.get(channel.id);
+		if (existingTimeout) clearTimeout(existingTimeout);
+
+		const timeout = setTimeout(
+			() => this.startEmptyTimeout(channel),
+			ongoingEmptyTimeout,
+		);
+
+		this.ongoingLoops.set(channel.id, timeout);
 	}
 
 	async moveChannel(channel: TextChannel, category: string) {
@@ -379,18 +394,6 @@ export class HelpChanModule extends Module {
 
 		await this.ensureAskChannels(channel.guild);
 		this.busyChannels.delete(channel.id);
-	}
-
-	private async checkDormantPossibilities() {
-		for (const channel of this.getOngoingChannels()) {
-			const messages = await channel.messages.fetch();
-
-			const diff =
-				Date.now() - (messages.first()?.createdAt.getTime() ?? 0);
-
-			if (diff > dormantChannelTimeout)
-				await this.markChannelAsDormant(channel);
-		}
 	}
 
 	private async updateStatusEmbed(
