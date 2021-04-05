@@ -126,8 +126,9 @@ export class HelpChanModule extends Module {
 		.setColor(TS_BLUE)
 		.setDescription(DORMANT_MESSAGE);
 
-	busyChannels: Set<string> = new Set(); // a lock to eliminate race conditions
-	ongoingEmptyTimeouts: Map<string, NodeJS.Timeout> = new Map(); // a lock used to prevent multiple timeouts running on the same channel
+	// This could be an array, but a map (by channel id) makes lookups easy
+	// Active and ongoing channels
+	helpChannels: Map<string, HelpChannel> = new Map();
 
 	private getChannelName(guild: Guild) {
 		const takenChannelNames = guild.channels.cache
@@ -143,15 +144,6 @@ export class HelpChanModule extends Module {
 		return `${this.CHANNEL_PREFIX}${decidedChannel}`;
 	}
 
-	private getOngoingChannels() {
-		return this.client.channels.cache
-			.filter(
-				channel =>
-					(channel as TextChannel).parentID === categories.ongoing,
-			)
-			.array() as TextChannel[];
-	}
-
 	@listener({ event: 'ready' })
 	async startDormantLoop() {
 		setInterval(() => {
@@ -161,40 +153,11 @@ export class HelpChanModule extends Module {
 
 	@listener({ event: 'ready' })
 	async initialCheckEmptyOngoing() {
-		for (const channel of this.getOngoingChannels()) {
-			if (await this.checkEmptyOngoing(channel)) {
-				await this.startEmptyTimeout(channel);
+		for (const channel of this.helpChannels.values()) {
+			if (await channel.isEmptyOngoing()) {
+				await channel.startEmptyTimeout();
 			}
 		}
-	}
-
-	// Utility function used to check if there are no messages in an ongoing channel, meaning the bot
-	// is the most recent message. This will be caused if somebody deletes their message after they
-	// claim a channel.
-	async checkEmptyOngoing(channel: TextChannel) {
-		const messages = await channel.messages.fetch();
-
-		const embed = messages.first()?.embeds[0];
-
-		return (
-			embed?.title &&
-			embed.title.trim() === this.OCCUPIED_EMBED_BASE.title?.trim()
-		);
-	}
-
-	async startEmptyTimeout(channel: TextChannel) {
-		const existingTimeout = this.ongoingEmptyTimeouts.get(channel.id);
-		if (existingTimeout) clearTimeout(existingTimeout);
-
-		const timeout = setTimeout(async () => {
-			this.ongoingEmptyTimeouts.delete(channel.id);
-
-			if (await this.checkEmptyOngoing(channel)) {
-				await this.markChannelAsDormant(channel);
-			}
-		}, ongoingEmptyTimeout);
-
-		this.ongoingEmptyTimeouts.set(channel.id, timeout);
 	}
 
 	@listener({ event: 'messageDelete' })
@@ -206,21 +169,7 @@ export class HelpChanModule extends Module {
 		)
 			return;
 
-		await this.startEmptyTimeout(msg.channel);
-	}
-
-	async moveChannel(channel: TextChannel, category: string) {
-		const parent = channel.guild.channels.resolve(category);
-		if (parent == null || !(parent instanceof CategoryChannel)) return;
-		const data: ChannelData = {
-			parentID: parent.id,
-			permissionOverwrites: parent.permissionOverwrites,
-		};
-		channel = await channel.edit(data);
-		channel = await channel.fetch();
-		await channel.setPosition(
-			(await channel.parent!.fetch()).children.size - 1,
-		);
+		await helpChannels.get(msg.channel.id)?.startEmptyTimeout();
 	}
 
 	@listener({ event: 'message' })
@@ -336,60 +285,9 @@ export class HelpChanModule extends Module {
 		}
 	}
 
-	private async markChannelAsDormant(channel: TextChannel) {
-		this.busyChannels.add(channel.id);
-
-		const memberPromise = HelpUser.findOneOrFail({
-			channelId: channel.id,
-		})
-			.then(helpUser =>
-				channel.guild.members.fetch({
-					user: helpUser.userId,
-				}),
-			)
-			// Do nothing, member left the guild
-			.catch(() => undefined);
-
-		const pinnedPromise = channel.messages.fetchPinned();
-
-		const newStatusPromise = this.moveChannel(
-			channel,
-			categories.dormant,
-		).then(() => channel.send(this.DORMANT_EMBED));
-
-		await Promise.all([
-			memberPromise,
-			pinnedPromise,
-			newStatusPromise,
-		]).then(([member, pinned, newStatus]) =>
-			Promise.all<unknown>([
-				this.updateStatusEmbed(
-					channel,
-					this.closedEmbed(newStatus),
-					pinned.array(),
-				),
-				...pinned
-					.filter(m => m.id !== newStatus.id)
-					.map(msg => msg.unpin()),
-				newStatus.pin(),
-				HelpUser.delete({ channelId: channel.id }),
-				member?.roles.remove(askCooldownRoleId),
-			]),
-		);
-
-		await this.ensureAskChannels(channel.guild);
-		this.busyChannels.delete(channel.id);
-	}
-
 	private async checkDormantPossibilities() {
-		for (const channel of this.getOngoingChannels()) {
-			const messages = await channel.messages.fetch();
-
-			const diff =
-				Date.now() - (messages.first()?.createdAt.getTime() ?? 0);
-
-			if (diff > dormantChannelTimeout)
-				await this.markChannelAsDormant(channel);
+		for (const channel of this.helpChannels.values()) {
+			if (await channel.isDormant()) await channel.markChannelAsDormant();
 		}
 	}
 
@@ -546,4 +444,102 @@ export class HelpChanModule extends Module {
 		await this.ensureAskChannels(msg.guild);
 		await msg.channel.send(':ok_hand:');
 	}
+}
+
+class HelpChannel {
+	// lock to eliminate race conditions
+	isBusy: boolean = false;
+	// lock used to prevent multiple timeouts running at a time
+	ongoingEmptyTimeout?: NodeJS.Timeout = undefined;
+
+	constructor(public channel: TextChannel) {
+		// Do anything?
+	}
+
+	// Utility function used to check if there are no messages in an ongoing channel, meaning the bot
+	// is the most recent message. This will be caused if somebody deletes their message after they
+	// claim a channel.
+	async isEmptyOngoing() {
+		const messages = await channel.messages.fetch();
+		const title = messages.first()?.embeds[0]?.title?.trim();
+		return title === this.OCCUPIED_EMBED_BASE.title?.trim(); // TODO: move embed base
+	}
+
+	async isDormant() {
+		const messages = await channel.messages.fetch();
+		const diff = Date.now() - (messages.first()?.createdTimestamp ?? 0);
+		return diff > dormantChannelTimeout;
+	}
+
+	async startEmptyTimeout() {
+		if (this.ongoingEmptyTimeout) clearTimeout(this.ongoingEmptyTimeout);
+
+		const timeout = setTimeout(async () => {
+			this.ongoingEmptyTimeout = undefined;
+
+			if (await this.isEmptyOngoing()) {
+				await this.markChannelAsDormant();
+			}
+		}, ongoingEmptyTimeout);
+
+		this.ongoingEmptyTimeout = timeout;
+	}
+
+	async markChannelAsDormant() {
+		this.isBusy = true;
+
+		const memberPromise = HelpUser.findOneOrFail({
+			channelId: this.channel.id,
+		})
+			.then(helpUser =>
+				this.channel.guild.members.fetch({
+					user: helpUser.userId,
+				}),
+			)
+			// Do nothing, member left the guild
+			.catch(() => undefined);
+
+		const pinnedPromise = this.channel.messages.fetchPinned();
+
+		const newStatusPromise = moveChannel(
+			this.channel,
+			categories.dormant,
+		).then(() => this.channel.send(this.DORMANT_EMBED));
+
+		await Promise.all([
+			memberPromise,
+			pinnedPromise,
+			newStatusPromise,
+		]).then(([member, pinned, newStatus]) =>
+			Promise.all<unknown>([
+				this.updateStatusEmbed(
+					this.channel,
+					this.closedEmbed(newStatus),
+					pinned.array(),
+				),
+				...pinned
+					.filter(m => m.id !== newStatus.id)
+					.map(msg => msg.unpin()),
+				newStatus.pin(),
+				HelpUser.delete({ channelId: this.channel.id }),
+				member?.roles.remove(askCooldownRoleId),
+			]),
+		);
+
+		this.isBusy = false;
+	}
+}
+
+async function moveChannel(channel: TextChannel, category: string) {
+	const parent = channel.guild.channels.resolve(category);
+	if (parent == null || !(parent instanceof CategoryChannel)) return;
+	const data: ChannelData = {
+		parentID: parent.id,
+		permissionOverwrites: parent.permissionOverwrites,
+	};
+	channel = await channel.edit(data);
+	channel = await channel.fetch();
+	await channel.setPosition(
+		(await channel.parent!.fetch()).children.size - 1,
+	);
 }
